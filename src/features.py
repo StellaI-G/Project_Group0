@@ -16,6 +16,11 @@ cannot leak test information. Filling, scaling and one-hot encoding happen in th
 model pipeline, fitted on the training folds only.
 """
 
+from sklearn.compose import ColumnTransformer
+from sklearn.impute import SimpleImputer
+from sklearn.pipeline import Pipeline
+from sklearn.preprocessing import OneHotEncoder, PowerTransformer, StandardScaler
+
 # ---------------------------------------------------------------------------
 # Set A: the 62 variables of the government PMT formula (those with a c_* coefficient)
 # why: same information as the government, so any gain comes from the method
@@ -66,7 +71,7 @@ TARGETS      = ["LOGCONSUMPTION", "poor"]
 NOT_FEATURES = ["hhid", "hhea", "prop", "share", "pcexppred", "fold"] + TARGETS
 
 # ---------------------------------------------------------------------------
-# Column types, for the preprocessing pipeline (make_preprocessor, to be added)
+# Column types, for the preprocessing pipeline (make_preprocessor, below)
 # ---------------------------------------------------------------------------
 # numbers: impute, Yeo-Johnson on the skewed ones, then scale (linear models, NN)
 #   missing values left by the cleaning: pcfloor (51), hhage and hhage2 (6 each) -> training median;
@@ -74,7 +79,36 @@ NOT_FEATURES = ["hhid", "hhea", "prop", "share", "pcexppred", "fold"] + TARGETS
 #   a few asset counts where the item is owned but the number is unknown -> training median
 NUMERIC = ["pcfloor", "hhsize", "hhsize2", "age04", "eschild", "jschild", "sschild",
            "depratio", "hhage", "hhage2", "vill2dist"] + B_COUNTS
-SKEWED  = ["pcfloor", "vill2dist", "depratio"] + B_COUNTS
+
+# SKEWED: numeric columns that get Yeo-Johnson (PowerTransformer) in the linear models and the NN.
+# why: a skewed column has many small values and a few very large ones (e.g. pcfloor: median 17 m²,
+#      maximum 490 m²). In a linear model those few large values dominate the fit. Yeo-Johnson
+#      stretches the crowded small values and compresses the long tail (notebook 211, section 3).
+# rule (measured on the TRAINING villages only, so the test villages played no part in the choice):
+#      skewness above 1  AND  Yeo-Johnson brings it below 0.5 (i.e. the transform actually works)
+#                skew before -> after
+#   pcfloor        5.4 -> 0.0    floor area per person
+#   vill2dist      2.0 -> 0.0    distance to district capital
+#   depratio       1.7 -> 0.1    dependency ratio
+#   eschild        1.3 -> 0.4    children in elementary school
+#   hr0628        17.1 -> 0.4    number of chickens
+#   hr0627        15.5 -> 0.3    jewelry
+#   hr0612         2.0 -> 0.3    fans
+#   hr0619         1.9 -> 0.1    mobile phones
+#   hr0621         1.4 -> 0.3    bicycles
+#   hr0615         1.4 -> 0.1    TVs
+#   hr0614         1.3 -> 0.3    radios
+#   hr0623         1.3 -> 0.2    motorcycles
+# NOT in the list, on purpose:
+#   - counts where 85-100% of households have 0 (boats, AC, car, pigs, horses, ...): skew stays
+#     high after the transform (e.g. 27 -> 20), because a pile of zeros cannot be made symmetric
+#   - hhsize2, hhage2: they are the squares of hhsize and hhage from the government formula;
+#     transforming them would break "size + size²"
+#   - hhsize, hhage, age04, jschild, sschild, hr0616, hr0610, ...: skew below 1, or not fixed
+# The columns not in the list are ordinary numbers: they are only standardized (StandardScaler).
+SKEWED = ["pcfloor", "vill2dist", "depratio", "eschild",
+          "hr0628", "hr0627", "hr0612", "hr0619", "hr0621", "hr0615", "hr0614", "hr0623"]
+
 # codes: one-hot
 CATEGORICAL = DISTRICT
 # everything else in a set is a 0/1 dummy: impute most frequent, pass through
@@ -87,6 +121,20 @@ VILLAGE_LEVEL = A_LOCATION + A_VILLAGE + DISTRICT
 def numeric(cols):
     """Numeric columns of a feature set (keeps the order of the set)."""
     return [c for c in cols if c in NUMERIC]
+
+
+def skewed(cols):
+    """Skewed numeric columns of a feature set: impute, then Yeo-Johnson.
+
+    PowerTransformer() already standardizes its output (standardize=True is the default),
+    so these columns need NO StandardScaler afterwards.
+    """
+    return [c for c in cols if c in SKEWED]
+
+
+def other_numeric(cols):
+    """Numeric columns of a feature set that are not skewed: impute, then StandardScaler."""
+    return [c for c in cols if c in NUMERIC and c not in SKEWED]
 
 
 def binary(cols):
@@ -102,6 +150,50 @@ def categorical(cols):
 def without_village_level(cols):
     """A feature set without the village-level columns (for the linear models)."""
     return [c for c in cols if c not in VILLAGE_LEVEL]
+
+
+def make_preprocessor(cols, scale=True, drop_first=False):
+    """Preprocessing for one feature set; put it in a Pipeline in front of the model.
+
+    scale=True: linear models and neural net.  scale=False: boosting.
+    drop_first=True: models without penalty (OLS, plain logistic regression).
+
+    Everything here is learned from data (medians, Yeo-Johnson lambda, means, standard
+    deviations, list of districts). Inside a Pipeline it is fitted on the training fold
+    only and then applied unchanged to the validation / test data ("estimate, then freeze").
+    """
+    skewed_cols = skewed(cols)
+    plain_cols  = other_numeric(cols)
+
+    median = SimpleImputer(strategy="median")
+    if scale:
+        skewed_steps = Pipeline([
+            # missing values are filled with the median: large values distort the mean,
+            # so the typical value is the safer fill
+            ("fill", median),
+            # a few very large values could otherwise dominate the fit; this compresses the
+            # long tail while keeping the order of the values
+            ("yeojohnson", PowerTransformer(method="yeo-johnson", standardize=True)),
+        ])
+    else:
+        skewed_steps = median   # boosting: only fill with the median, trees need no transform
+
+    columns = ColumnTransformer([   # (name, what is done, which columns)
+        ("skewed",   skewed_steps, skewed_cols),
+        ("numbers",  median, plain_cols),          # not skewed: only the median fill
+        # most frequent of 0 and 1: at most 13 missing values per column, too few to move the model
+        ("dummies",  SimpleImputer(strategy="most_frequent"), binary(cols)),
+        # district code -> one 0/1 column per district; with drop_first one district is the reference
+        ("district", OneHotEncoder(drop="first" if drop_first else None,
+                                   handle_unknown="ignore", sparse_output=False),
+                     categorical(cols)),
+    ], remainder="drop", verbose_feature_names_out=False)
+
+    if not scale:
+        return columns
+    # StandardScaler on all inputs. After Yeo-Johnson it is harmless: PowerTransformer already
+    # returns mean 0 / sd 1, so the scaler subtracts 0 and divides by 1 for those columns.
+    return Pipeline([("columns", columns), ("scale", StandardScaler())])
 
 
 def check_feature_sets(data):
